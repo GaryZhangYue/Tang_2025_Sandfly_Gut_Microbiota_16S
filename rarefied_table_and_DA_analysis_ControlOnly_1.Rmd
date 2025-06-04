@@ -1,0 +1,1156 @@
+---
+title: "Downstream analysis (diversity, taxonomy, and differential abundance)"
+date: "`r Sys.Date()`"
+author: Yue (Gary) Zhang, PhD
+output:
+  rmdformats::readthedown:
+    self_contained: true
+    thumbnails: true
+    lightbox: true
+    gallery: false
+    highlight: tango
+    code_folding: hide
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(warning = T, message = T,echo = T) 
+```
+
+
+```{r Initiate, results='hide'}
+.libPaths('/Users/zhangy68/R/R_4.4.2')
+###########Preparation################
+#load required packages
+packages_to_load = c('stringr','phyloseq','vegan','tidyr','ggplot2','qiime2R',
+                     'dplyr','ANCOMBC','usedist','rioja','ggpubr','spaa','ape',
+                     'cowplot','ggforestplot','GGally','scales','metagMisc','ggsci','rstatix','wesanderson','RColorBrewer','jakR',
+                     'DT','iCAMP')
+lapply(packages_to_load,require, character.only = T)
+
+#generating color palettes
+col1 = wes_palette("Rushmore1")
+col2 = wes_palette("GrandBudapest2")
+col3 = wes_palette('Darjeeling2')
+col21 <- rev(c("tomato1","darkblue","turquoise1","lightblue","darkred","mediumblue","purple","bisque",
+               "greenyellow","yellow","violetred2","darkgreen","darkgoldenrod1","deeppink3","cadetblue4",
+               "orchid2","seagreen3","purple4","dodgerblue2","red","gray27"))
+
+#set random seed
+set.seed(666)
+```
+
+```{r function section}
+create_dt <- function(df,caption){
+  datatable(df,
+                caption = caption,
+                extensions = 'Buttons',
+                options = list(dom = 'Blfrtip',
+                               buttons = c('copy', 'csv', 'excel', 'pdf', 'print'),
+                               lengthMenu = list(c(10,25,50,-1),
+                                                 c(10,25,50,"All"))))
+}
+
+# function to set a column as rownames and remove that column from the df; default is setting the first column as the rowname
+setrowname =  function(df,col = 1){
+  if (is.numeric(col)) {
+    # print('it is a number')
+    rownames(df) = df[,col]
+    df = df[,-col]
+  } else {
+    # print('it is a string')
+    rownames(df) = df[,which(names(df) %in% c(col))]
+    df = df[,-which(names(df) %in% c(col))]
+  }
+  return(df)
+} 
+
+# function to collapse days into phases
+collapse_phase = function(df) {
+  df$phase = ifelse(df$Day.numeric == 0 , 'pre-infection',
+                    ifelse(df$Day.numeric <= 5, 'early infection', 'late infection'))
+  return(df)
+}
+
+# function to collapse tax/asv table to a desired taxanomy rank
+collapse_tax = function(rank='Phylum',ft=9){
+  # rank='Phylum'
+  # ft=9
+  #aggregate the ASV table to the phylum level
+  tax.o %>%
+    dplyr::select(rank) %>%
+    merge(x = ., y = asv.off, all.y = T, by = 0) -> asv.offp
+  rownames(asv.offp) <- asv.offp$Row.names
+  asv.offp = asv.offp[,-c(1)]
+  #change NA in Phylum column to unknown
+  asv.offp[[rank]][is.na(asv.offp[[rank]])] = 'Unknown'
+  #select the desired taxa rank, and collapse onto the rank
+  if (rank == 'Kingdom'){
+    asv.offp = aggregate(. ~ Kingdom,asv.offp, sum)
+  }  else if (rank == 'Phylum') {
+    asv.offp = aggregate(. ~ Phylum,asv.offp, sum)
+  } else if (rank == 'Class') {
+    asv.offp = aggregate(. ~ Class,asv.offp, sum)
+  } else if (rank == 'Order') {
+    asv.offp = aggregate(. ~ Order,asv.offp, sum)
+  } else if (rank == 'Family') {
+    asv.offp = aggregate(. ~ Family,asv.offp, sum)
+  } else if (rank == 'Genus') {
+    asv.offp = aggregate(. ~ Genus,asv.offp, sum)
+  } else if (rank == 'Species') {
+    asv.offp = aggregate(. ~ Species,asv.offp, sum)
+  }
+  # sanity check
+  if (all(round(colSums(asv.offp[,-c(1)])*100) == 100)) {
+    rownames(asv.offp) = asv.offp[[rank]]
+    asv.offp = select(asv.offp, select = -rank)
+    #retain the ft most abundant taxa; calculate the sum of all the others
+    asv.offp = asv.offp[order(rowSums(asv.offp), decreasing = T),]  
+    asv.offps = bind_rows(asv.offp[c(1:ft),],colSums(asv.offp[c(c(ft+1):nrow(asv.offp)),]))
+    rownames(asv.offps)[c(ft+1)] = 'All others'
+    if (all(round(colSums(asv.offps)*100) ==100)) {
+      rownames(asv.offps) -> asv.offps[[rank]]
+      asv.offps.s = gather(asv.offps,"SD","frequency",-{{rank}})
+      #merge the stacked ASV table with a subset of metadata to include some categorization columns
+      metadata.o %>%
+        dplyr::select(`Condition`,`Day.categorical`,`Replicate_index`,phase) %>%
+        merge(x = ., y = asv.offps.s, all.x = T, by.x = 0, by.y = "SD") -> asv.offps.s
+      
+      #coerce the phylum column to ordered factors for plotting
+      asv.offps.s[[rank]] = factor(asv.offps.s[[rank]], levels = c(rownames(asv.offps)))
+      asv.offps.s$Row.names = as.character(asv.offps.s$Row.names)
+    } else {asv.offps.s = NULL}
+  } else {asv.offps.s = NULL}
+  return(list(asv.offp,asv.offps,asv.offps.s))
+}
+
+# function to generate a new directory with a designated name; if the directory already exists, it will delete it recreate a new one
+create_dir = function(res_dir){
+  if (file.exists(res_dir)){
+  unlink(res_dir,recursive = TRUE)
+  dir.create(res_dir,recursive = T)
+} else {
+  dir.create(res_dir,recursive = T)
+}
+  return(paste0('Directory ', res_dir, ' created'))
+}
+
+# function to read in the diversity metrix
+read_alpha_diversity = function(path_to_qza) {
+  alpha = read_qza(path_to_qza)
+  alpha <- alpha$data %>% tibble::rownames_to_column("SampleID") 
+  alpha = merge(x = alpha,
+                y = metadata.o,
+                by.x = 'SampleID',
+                by.y = 0,
+                all.Y = T)
+  return(alpha)
+}
+
+```
+
+# Metadata preprocessing
+
+```{r output dir}
+
+###########load variables##########
+PFIG = FAS = 'R_analysis_output_controlOnlyAnalysis/rarefied_table'
+direct_message= create_dir(FAS)
+
+```
+```{r metadata prep}
+############metadata pre-processing###################
+metadata = read.csv('analysis_from_bcdPrm/metadata_parsed_validated.tsv',sep = '\t')
+# summary(metadata)
+#keep the column type row
+metadata_typerow = metadata[1,]
+metadata = metadata[-1,]
+
+metadata = select(metadata,c(`sample.id`,`Condition`,`Day.numeric`,`Day.categorical`,`Condition_day`,`Replicate`,`Experiment`))
+#retain the control samples and remove anything else
+metadata = subset(metadata,Condition == 'CTRL')
+metadata$Day.numeric = as.numeric(metadata$Day.numeric)
+#generate a categorical day column
+metadata$Day.categorical = ifelse(nchar(metadata$Day.categorical) == 1, paste0('0',metadata$Day.categorical),metadata$Day.categorical)
+#generate a replicate index column
+metadata = metadata[order(metadata$Day.categorical),]
+metadata$Replicate_index = sequence(table(metadata$Day.categorical))
+#collapse days to phases
+metadata = collapse_phase(metadata)
+write.table(metadata, paste(FAS,'metadata_selected_rows_controlOnlyAnalysis.csv',sep = '/'),sep = '\t', quote = F,row.names = F)
+
+metadata %>%
+  group_by(Condition, phase, Day.categorical,) %>%
+  summarize(Sample_count = n()) %>%
+  as.data.frame-> metadata.summary
+
+create_dt(metadata,'Metadata')
+create_dt(metadata.summary,'Summary of metadata')
+```
+
+# ASV and taxonomy tables
+
+```{r phyloseq prep,results='markup'}
+############input data using phyloseq package###############
+#Create a phyloseq object
+pr<-qza_to_phyloseq(
+  features="analysis_from_bcdPrm/PE_bcdPrm_core-metrics-results/rarefied_table.qza",
+  tree="analysis_from_bcdPrm/PE_bcdPrm_rooted-tree.qza",
+  taxonomy="analysis_from_bcdPrm/PE_bcdPrm_taxonomy.qza",
+  metadata=paste(FAS,'metadata_selected_rows_controlOnlyAnalysis.csv',sep = '/'))
+
+asv = data.frame(otu_table(pr)) #note that the asv is the raw table which has not been normalized by either rows or columns
+tax = data.frame(tax_table(pr))
+metadata= data.frame(sample_data(pr))
+
+metadata$Replicate_index = as.character(metadata$Replicate_index)
+metadata$Day.categorical = as.numeric(metadata$Day.categorical)
+metadata$Day.categorical = ifelse(nchar(metadata$Day.categorical) == 1, paste0('0',metadata$Day.categorical),metadata$Day.categorical)
+
+#####################ASV table pre-processing##############################
+#order the asv table based on the total counts across all samples
+asv$sum = apply(asv,1,sum)
+asv.o = asv[order(asv$sum,decreasing = T),]
+
+#remove the ghost ASVs
+asv.o %>% dplyr::filter(sum >0) %>% as.data.frame -> asv.of # many ASVs removed for 0 count (since we removed TC1) is removed
+
+cat(paste0('Total number of ASVs = ', nrow(asv.of))) 
+cat(paste0('Total number of reads = ', sum(asv.of$sum))) 
+
+#simplify the ASV ID
+nums <- sprintf('%0.4d', 1:nrow(asv.of)) ##creating string "00001", "00002"。。。
+ASVnames <- paste("ASV",nums, sep="")
+ASVconversion <- data.frame(ASV_ID = rownames(asv.of),ASVnames, stringsAsFactors = F) #make df with two columns
+rownames(asv.of) = ASVconversion$ASVnames
+write.csv(x = ASVconversion, file = paste(FAS,"/ASVconversion.csv", sep = ''),
+          row.names = T)
+
+asv.of = select(asv.of, -sum)
+asv.of = asv.of[,order(names(asv.of))]
+metadata.o = metadata[order(rownames(metadata)),]
+# sanity check
+if (!all(names(asv.of) == rownames(metadata.o))) {
+  stop("samples do not match between metadata and table. Execution stopped here")
+}
+#calculate frequency -- normalize by sample
+asv.off = decostand(asv.of,2,method = 'total')
+#sanity check relative abundance sum == 1
+if (!all(round(colSums(asv.off),digits = 2) == 1)) {
+  stop("sum of rel abu is not 100%. Execution stopped here")
+}
+```
+
+## ASV table
+
+```{R ASV TABLE SHOW}
+create_dt(asv.off,'ASV table (rarefied and normalized)')
+create_dt(ASVconversion,'ASV names (used in downstream analysis) and ASV ID (QIIME2 original output) conversion table')
+```
+
+## Taxonomy table
+
+```{r parse taxa table}
+#############taxonomic table pre-processing################
+#remove the ghost ASVs in the taxonomy table
+tax = subset(tax, rownames(tax) %in% ASVconversion$ASV_ID) # nothing is removed
+rownames(tax) = ASVconversion$ASVnames[match(rownames(tax),ASVconversion$ASV_ID)]
+tax.o = tax[order(rownames(tax)),]
+
+create_dt(tax.o,'Taxonomy table')
+```
+
+# Taxonomy bar plot
+
+## Genus level
+
+```{r taxa bar plots}
+# customized color sets to match colors between family and genus plots -- only apply to this set of figures
+col10.genus = c("bisque", "red", "dodgerblue2", "purple4", "orchid2", "cadetblue4", 
+  "deeppink3", "darkgoldenrod1",  "gray27", "darkgreen")
+col10.family = c("bisque", "red", "dodgerblue2", "purple4", "seagreen3", "orchid2", "cadetblue4", 
+  "deeppink3", "darkgoldenrod1", "darkgreen")
+#make bar plot
+asv.taxa.genus = collapse_tax(rank='Genus')
+asv.taxa.genus.stacked = asv.taxa.genus[[3]]
+asv.taxa.genus.stacked$Day_ReplicateIndex = paste0('Day-', asv.taxa.genus.stacked$Day.categorical, ' S', asv.taxa.genus.stacked$Replicate_index)
+asv.taxa.genus.stacked$phase = factor(asv.taxa.genus.stacked$phase,levels = c('pre-infection', 'early infection', 'late infection'))
+asv.taxa.genus.stacked$Genus = factor(asv.taxa.genus.stacked$Genus, c(setdiff(unique(asv.taxa.genus.stacked$Genus),c('Unknown','All others')),c('Unknown','All others')))
+ggplot(data = asv.taxa.genus.stacked, mapping = aes(x = `Replicate_index`, y = `frequency`,fill = Genus)) +
+  geom_bar(stat="identity",color = 'black') +
+  scale_fill_manual(values = col10.genus) +
+  facet_wrap(~`Day.categorical`,scales = "free_x",nrow = 1) +
+  theme_classic() +
+  theme(legend.title = element_blank(),
+        legend.position = 'bottom',
+        legend.text = element_text(size = 12),
+        legend.key.size = unit(0.3,'cm'),
+        axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1,size=10, face = 'bold', color = 'black'),
+        axis.text.y = element_text(size=15, face = 'bold', color = 'black'),
+        axis.title=element_text(size=18,face="bold"),
+        strip.text.x = element_text(size = 15, color = "black", face = "bold"),
+        strip.text.y = element_text(size = 15, color = "black", face = "bold"),
+        strip.background = element_rect(color="black", fill="grey95", size=1.5, linetype="solid"))+
+  xlab("Replicates") + ylab('Relative Abundance') +
+  guides(fill=guide_legend(nrow=2))
+ggsave(paste(PFIG,"/",'Taxonomy_top_9_genera_barplot_byDay.png',sep = ""),width = 10, height = 5, device = 'png')
+
+
+ggplot(data = asv.taxa.genus.stacked, mapping = aes(x = `Day_ReplicateIndex`, y = `frequency`,fill = Genus)) +
+  geom_bar(stat="identity",color = 'black') +
+  scale_fill_manual(values = col10.genus) +
+  facet_wrap(~`phase`,scales = "free_x",nrow = 1) +
+  theme_classic() +
+  theme(legend.title = element_blank(),
+        legend.position = 'bottom',
+        legend.text = element_text(size = 12),
+        legend.key.size = unit(0.3,'cm'),
+        axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1,size=10, face = 'bold', color = 'black'),
+        axis.text.y = element_text(size=15, face = 'bold', color = 'black'),
+        axis.title=element_text(size=18,face="bold"),
+        strip.text.x = element_text(size = 15, color = "black", face = "bold"),
+        strip.text.y = element_text(size = 15, color = "black", face = "bold"),
+        strip.background = element_rect(color="black", fill="grey95", size=1.5, linetype="solid"))+
+  xlab("Replicates") + ylab('Relative Abundance') +
+  guides(fill=guide_legend(nrow=2))
+ggsave(paste(PFIG,"/",'Taxonomy_top_9_genera_barplot_byPhase.png',sep = ""),width = 10, height = 5, device = 'png')
+
+```
+
+```{r taxa genus collapsed,fig.width=5}
+asv.taxa.genus.stacked.collapsedByPhases = asv.taxa.genus.stacked %>%
+  subset(select = c(phase,Genus,frequency)) %>%
+  group_by(phase,Genus) %>%
+  summarise(frequency_avg=mean(frequency))
+
+# sanity check
+stopifnot(round(sum(subset(asv.taxa.genus.stacked.collapsedByPhases,phase == 'pre-infection')$frequency_avg),digits = 2) == 1)
+stopifnot(round(sum(subset(asv.taxa.genus.stacked.collapsedByPhases,phase == 'early infection')$frequency_avg),digits = 2) == 1)
+stopifnot(round(sum(subset(asv.taxa.genus.stacked.collapsedByPhases,phase == 'late infection')$frequency_avg),digits = 2) == 1)
+
+create_dt(asv.taxa.genus.stacked.collapsedByPhases,'Relative abundance at genus level merged by phases')
+
+asv.taxa.genus.stacked$Genus = factor(asv.taxa.genus.stacked$Genus, c(setdiff(unique(asv.taxa.genus.stacked$Genus),c('Unknown','All others')),c('Unknown','All others')))
+ggplot(data = asv.taxa.genus.stacked.collapsedByPhases, mapping = aes(x = phase, y = `frequency_avg`,fill = Genus)) +
+  geom_bar(stat="identity",color = 'black') +
+  scale_fill_manual(values = col10.genus) +
+  theme_classic() +
+  theme(legend.title = element_blank(),
+        legend.position = 'right',
+        legend.text = element_text(size = 12),
+        legend.key.size = unit(0.3,'cm'),
+        axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1,size=10, face = 'bold', color = 'black'),
+        axis.text.y = element_text(size=15, face = 'bold', color = 'black'),
+        axis.title=element_text(size=18,face="bold"),
+        strip.text.x = element_text(size = 15, color = "black", face = "bold"),
+        strip.text.y = element_text(size = 15, color = "black", face = "bold"),
+        strip.background = element_rect(color="black", fill="grey95", size=1.5, linetype="solid"))+
+  xlab("Phase") + ylab('Relative Abundance') +
+  guides(fill=guide_legend(ncol=1))
+```
+
+
+## Family level
+
+```{r taxa bar plots family,fig.width=12,fig.height=6}
+
+#make bar plot
+asv.taxa.family = collapse_tax(rank='Family')
+asv.taxa.family.stacked = asv.taxa.family[[3]]
+asv.taxa.family.stacked$Day_ReplicateIndex = paste0('Day-',asv.taxa.family.stacked$Day.categorical, ' S', asv.taxa.family.stacked$Replicate_index)
+asv.taxa.family.stacked$phase = factor(asv.taxa.family.stacked$phase,levels = c('pre-infection', 'early infection', 'late infection'))
+ggplot(data = asv.taxa.family.stacked, mapping = aes(x = `Replicate_index`, y = `frequency`,fill = Family)) +
+  geom_bar(stat="identity",color = 'black') +
+  scale_fill_manual(values = col10.family) +
+  facet_wrap(~`Day.categorical`,scales = "free_x",nrow = 1) +
+  theme_classic() +
+  theme(legend.title = element_blank(),
+        legend.position = 'bottom',
+        legend.text = element_text(size = 12),
+        legend.key.size = unit(0.3,'cm'),
+        axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1,size=10, face = 'bold', color = 'black'),
+        axis.text.y = element_text(size=15, face = 'bold', color = 'black'),
+        axis.title=element_text(size=18,face="bold"),
+        strip.text.x = element_text(size = 15, color = "black", face = "bold"),
+        strip.text.y = element_text(size = 15, color = "black", face = "bold"),
+        strip.background = element_rect(color="black", fill="grey95", size=1.5, linetype="solid"))+
+  xlab("Replicates") + ylab('Relative Abundance') +
+  guides(fill=guide_legend(nrow=2))
+ggsave(paste(PFIG,"/",'Taxonomy_top_9_families_barplot_byDay.png',sep = ""),width = 10, height = 5, device = 'png')
+
+
+ggplot(data = asv.taxa.family.stacked, mapping = aes(x = `Day_ReplicateIndex`, y = `frequency`,fill = Family)) +
+  geom_bar(stat="identity",color = 'black') +
+  scale_fill_manual(values = col10.family) +
+  facet_wrap(~`phase`,scales = "free_x",nrow = 1) +
+  theme_classic() +
+  theme(legend.title = element_blank(),
+        legend.position = 'bottom',
+        legend.text = element_text(size = 12),
+        legend.key.size = unit(0.3,'cm'),
+        axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1,size=10, face = 'bold', color = 'black'),
+        axis.text.y = element_text(size=15, face = 'bold', color = 'black'),
+        axis.title=element_text(size=18,face="bold"),
+        strip.text.x = element_text(size = 15, color = "black", face = "bold"),
+        strip.text.y = element_text(size = 15, color = "black", face = "bold"),
+        strip.background = element_rect(color="black", fill="grey95", size=1.5, linetype="solid"))+
+  xlab("Replicates") + ylab('Relative Abundance') +
+  guides(fill=guide_legend(nrow=2))
+ggsave(paste(PFIG,"/",'Taxonomy_top_9_families_barplot_byPhase.png',sep = ""),width = 10, height = 5, device = 'png')
+
+```
+
+```{r taxa family collapsed,fig.width=5}
+asv.taxa.family.stacked.collapsedByPhases = asv.taxa.family.stacked %>%
+  subset(select = c(phase,Family,frequency)) %>%
+  group_by(phase,Family) %>%
+  summarise(frequency_avg=mean(frequency))
+
+# sanity check
+stopifnot(round(sum(subset(asv.taxa.family.stacked.collapsedByPhases,phase == 'pre-infection')$frequency_avg),digits = 2) == 1)
+stopifnot(round(sum(subset(asv.taxa.family.stacked.collapsedByPhases,phase == 'early infection')$frequency_avg),digits = 2) == 1)
+stopifnot(round(sum(subset(asv.taxa.family.stacked.collapsedByPhases,phase == 'late infection')$frequency_avg),digits = 2) == 1)
+
+create_dt(asv.taxa.family.stacked.collapsedByPhases,'Relative abundance at family level merged by phases')
+
+ggplot(data = asv.taxa.family.stacked.collapsedByPhases, mapping = aes(x = phase, y = `frequency_avg`,fill = Family)) +
+  geom_bar(stat="identity",color = 'black') +
+  scale_fill_manual(values = col10.family) +
+  theme_classic() +
+  theme(legend.title = element_blank(),
+        legend.position = 'right',
+        legend.text = element_text(size = 12),
+        legend.key.size = unit(0.3,'cm'),
+        axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1,size=10, face = 'bold', color = 'black'),
+        axis.text.y = element_text(size=15, face = 'bold', color = 'black'),
+        axis.title=element_text(size=18,face="bold"),
+        strip.text.x = element_text(size = 15, color = "black", face = "bold"),
+        strip.text.y = element_text(size = 15, color = "black", face = "bold"),
+        strip.background = element_rect(color="black", fill="grey95", size=1.5, linetype="solid"))+
+  xlab("Phase") + ylab('Relative Abundance') +
+  guides(fill=guide_legend(ncol=1))
+```
+
+# Alpha diversity
+
+
+```{r alpha div}
+#######################Alpha diversity analysis############################
+shannon = read_alpha_diversity("analysis_from_bcdPrm/PE_bcdPrm_core-metrics-results/shannon_vector.qza")
+evenness = read_alpha_diversity("analysis_from_bcdPrm/PE_bcdPrm_core-metrics-results/evenness_vector.qza")
+faithpd = read_alpha_diversity("analysis_from_bcdPrm/PE_bcdPrm_core-metrics-results/faith_pd_vector.qza")
+obsasv = read_alpha_diversity("analysis_from_bcdPrm/PE_bcdPrm_core-metrics-results/observed_features_vector.qza")
+```
+
+## Number of ASVs
+
+```{r color scheme}
+custom_colors_phase <- c(
+  "pre-infection"  = "#999999",  # Grey
+  "early infection"     = "#E41A1C",  # Red
+  "late infection"  = "orange"  # Orange
+)
+custom_colors_day <- c(
+  "00"  = "#999999",  # Grey
+  "02"  = "#E41A1C",  # Red
+  "05"  = "#E41A1C",  # Red
+  "07"  = "orange",  # Orange
+  "09"  = "orange",  # Orange
+  "12"  = "orange"  # Orange
+)
+```
+
+### Grouped by day
+
+```{r feature plots by day, fig.height=6,fig.width=8}
+stat.test.obsasv <- obsasv %>% #change here 2
+  dunn_test(observed_features ~ `Day.categorical`) %>% #change here 1
+  subset(group1 == '00') %>%
+  adjust_pvalue(method = "holm") %>%
+  add_significance("p.adj") %>%
+  add_x_position(x = "Day.categorical") %>%
+  add_y_position(step.increase = 0.1)
+
+
+create_dt(stat.test.obsasv,"Dunn's test comparing each day to day 0 (p val adjusted by holm method)")
+
+
+(plot.obsasv.day = ggboxplot(obsasv, x = 'Day.categorical', y = 'observed_features', fill = 'Day.categorical',  # change here 3, obj, y = ...
+                               size = 1, add = "jitter")+
+    xlab("Days") + ylab('Observed ASVs') + ggtitle('Observed ASVs') + # change here ylab and ggtitle
+    coord_cartesian(ylim = c(0,max(obsasv[,2]+50)))+ # change here max()
+    theme(text = element_text(size = 22), legend.position = 'none',
+          axis.text.x = element_text(angle = 50, hjust = 1))+
+    scale_fill_manual(values = custom_colors_day))
+
+(plot.obsasv.day = plot.obsasv.day + stat_compare_means(method = "kruskal.test", label.y = max(obsasv[,2]+ 50), size = 6))
+
+
+(plot.obsasv.day = plot.obsasv.day + stat_pvalue_manual(subset(stat.test.obsasv, p.adj < 0.05),label = 'p.adj.signif', tip.length = 0.01))
+
+ggsave(paste(PFIG,"/",'alpha_diversity_byDay.png',sep = ""),width = 20, height = 5, device = 'png',limitsize = FALSE)
+
+```
+
+### Grouped by phases
+
+```{r feature plots by phase,fig.height=8,fig.width=8}
+obsasv$phase = factor(obsasv$phase,levels = c('pre-infection','early infection', 'late infection'))
+stat.test.obsasv <- obsasv %>% #change here 2
+  dunn_test(observed_features ~ phase) %>% #change here 1
+  adjust_pvalue(method = "holm") %>%
+  add_significance("p.adj") %>%
+  add_x_position(x = "phase") %>%
+  add_y_position(step.increase = 0.1)
+
+create_dt(stat.test.obsasv,"Dunn's test for pairwise comparison (p val adjusted by holm method)" )
+
+(plot.obsasv.phase1 = ggboxplot(obsasv, x = 'phase', y = 'observed_features', fill = 'phase',  # change here 3, obj, y = ...
+                               size = 1, add = "jitter")+
+    xlab("Phase") + ylab('Observed ASVs') + ggtitle('Observed ASVs') + # change here ylab and ggtitle
+    theme(text = element_text(size = 22), legend.position = 'none',
+          axis.text.x = element_text(angle = 50, hjust = 1))+
+    scale_fill_manual(values = custom_colors_phase)) 
+
+(plot.obsasv.phase2 = plot.obsasv.phase1 + 
+    stat_compare_means(method = "kruskal.test", label.x = 0.7, label.y = max(obsasv[,2]+10), size = 6)) 
+
+(plot.obsasv.phase3 = plot.obsasv.phase1 + 
+    stat_compare_means(method = "kruskal.test", label.x = 0.7, label.y = max(obsasv[,2]+40), size = 6) +
+    stat_pvalue_manual(subset(stat.test.obsasv, p.adj < 0.05),label = 'p.adj.signif', tip.length = 0.01))
+
+
+ggsave(paste(PFIG,"/",'alpha_diversity_byPhase.png',sep = ""),width = 20, height = 5, device = 'png',limitsize = FALSE)
+```
+
+## Other alpha diversity metrics
+
+### Shannon index
+
+```{r shannon, fig.height=8,fig.width=8}
+# Alpha diversity by phases 
+# shannon
+shannon$phase = factor(shannon$phase,levels = c('pre-infection','early infection', 'late infection'))
+
+(plot.shannon.phase1 = ggboxplot(shannon, x = 'phase', y = 'shannon_entropy', fill = 'phase',  # change here 3, obj, y = ...
+                                size = 1, add = "jitter")+
+    xlab("Phase") + ylab('Shannon Index') + ggtitle('Shannon Index') + # change here ylab and ggtitle
+    theme(text = element_text(size = 22), legend.position = 'none',
+          axis.text.x = element_text(angle = 50, hjust = 1))+
+    scale_fill_manual(values = custom_colors_phase))
+
+(plot.shannon.phase2 = plot.shannon.phase1 +
+    stat_compare_means(method = "kruskal.test", label.x = 0.7, label.y = max(shannon[,2]+ 0.5), size = 6)) 
+```
+
+### Pielou's evenness
+
+```{r evenness, fig.height=8,fig.width=8}
+# evenness
+evenness$phase = factor(evenness$phase,levels = c('pre-infection','early infection', 'late infection'))
+
+(plot.evenness.phase1 = ggboxplot(evenness, x = 'phase', y = 'pielou_evenness', fill = 'phase',  # change here 3, obj, y = ...
+                                 size = 1, add = "jitter")+
+    xlab("Phase") + ylab('Pielou evenness') + ggtitle('Pielou evenness') + # change here ylab and ggtitle
+    theme(text = element_text(size = 22), legend.position = 'none',
+          axis.text.x = element_text(angle = 50, hjust = 1))+
+    scale_fill_manual(values = custom_colors_phase)) 
+(plot.evenness.phase2 = plot.evenness.phase1 + stat_compare_means(method = "kruskal.test", label.x = 0.7, label.y = max(evenness[,2]+ 0.04), size = 6))
+
+```
+
+### Faith's phylogenetic distance
+
+```{r faithpd, fig.width=8, fig.height=8}
+
+# faith pd
+faithpd$phase = factor(faithpd$phase,levels = c('pre-infection','early infection', 'late infection'))
+
+(plot.faithpd.phase1 = ggboxplot(faithpd, x = 'phase', y = 'faith_pd', fill = 'phase',  # change here 3, obj, y = ...
+                                size = 1, add = "jitter")+
+    xlab("Phase") + ylab('Faith pd') + ggtitle('Faith PD') + # change here ylab and ggtitle
+    theme(text = element_text(size = 22), legend.position = 'none',
+          axis.text.x = element_text(angle = 50, hjust = 1))+
+    scale_fill_manual(values = custom_colors_phase))
+(plot.faithpd.phase2 = plot.faithpd.phase1 + stat_compare_means(method = "kruskal.test", label.x = 0.7, label.y = max(faithpd[,2]), size = 6))
+
+```
+
+
+### Combined alpha diversity plot
+
+
+```{r alpha plots, fig.width=16, fig.height = 16}
+plot_grid(plot.obsasv.phase3,
+          plot.shannon.phase1,
+          plot.evenness.phase1,
+          plot.faithpd.phase1,
+          ncol = 2)
+
+plot_grid(plot.obsasv.phase3,
+          plot.shannon.phase2,
+          plot.evenness.phase2,
+          plot.faithpd.phase2,
+          ncol = 2)
+
+ggsave(paste(PFIG,"/",'alpha_diversity_byPhase_pvalue_annot.png',sep = ""),width = 15, height = 20, device = 'png',limitsize = FALSE)
+
+
+```
+
+# Beta diversity (weighted UniFrac)
+
+```{r wu}
+
+###########################PCoA plot using the Weighted UniFrac distance###############
+#read the distance matrix output by QIIME2
+dm = read_qza("analysis_from_bcdPrm/PE_bcdPrm_core-metrics-results/weighted_unifrac_distance_matrix.qza")
+#select the rows we need
+dm = dist_subset(dm$data,rownames(metadata.o))
+#some distance measures may result in negative eigenvalues. In that case, add a correction:
+pcoa.wunifrac = pcoa(dm,correction = 'cailliez')
+#transform the pcoa.wunifrac object into a df for making it plottable with ggplot2
+coordinates.pcoa.wunifrac = data.frame(pcoa.wunifrac$vectors,check.names = FALSE)[,c(1:2)]
+coordinates.pcoa.wunifrac[['phase']] = metadata.o[['phase']][match(rownames(coordinates.pcoa.wunifrac),rownames(metadata.o))] 
+
+centroids <- coordinates.pcoa.wunifrac %>%
+  group_by_at('phase') %>%
+  summarize(CentroidX = mean(Axis.1), CentroidY = mean(Axis.2))
+coordinates.pcoa.wunifrac = merge(coordinates.pcoa.wunifrac,centroids, by = 'phase')           
+  
+#plot for all samples
+#Adonis test
+if (!all(rownames(metadata.o) == names(dm))) {
+  stop("samples do not match between metadata and table. Execution stopped here")
+}
+
+adonis.r = adonis2(dm~phase,metadata.o,permut = 1000)
+adonis.p = round(adonis.r$`Pr(>F)`[1],digit = 4)
+
+betadisp.r = permutest(betadisper(dm,metadata.o$phase),permutations = 1000)
+betadisp.p = round(betadisp.r$tab[[6]][1],digit = 4)
+#plot
+metadata.o$phase = factor(metadata.o$phase,levels = c('pre-infection','early infection', 'late infection'))
+
+(pcoa=ggplot()+
+    geom_point(data=subset(coordinates.pcoa.wunifrac),
+               mapping = aes(x = `Axis.1`, y = `Axis.2`, color = phase),
+               alpha = 0.6, size = 2) + 
+    labs(title = 'Weighted UniFrac Distance',
+         subtitle = paste0('p(adonis) = ', adonis.p, ', p(betadisp) = ', betadisp.p))+
+    geom_segment(data = coordinates.pcoa.wunifrac,
+             aes(x = CentroidX, xend = Axis.1, y = CentroidY, yend = Axis.2, color = phase),
+             alpha = 0.3, size = 0.3) +
+    geom_point(data = centroids,
+             aes(x = CentroidX, y = CentroidY, fill = phase),
+             size = 4, shape = 21, stroke = 1.2, color = 'black') +
+    xlab(paste('PC1 (',label_percent()(pcoa.wunifrac$values$Rel_corr_eig[1]),')',sep = '')) +
+    ylab(paste('PC2 (',label_percent()(pcoa.wunifrac$values$Rel_corr_eig[2]),')',sep = '')) +
+    theme(panel.grid.major = element_blank(),
+          panel.grid.minor = element_blank(),
+          panel.background = element_blank(),
+          axis.line = element_line(colour = 'black'),
+          legend.title=element_blank(),
+          legend.position = 'right',
+          legend.text = element_text(size=15))+
+    scale_color_manual(values = custom_colors_phase) +
+  scale_fill_manual(values = custom_colors_phase))
+ggsave(paste(PFIG,"/",'pcoa_weightedUniFrac.coloredByPhase.withEllipse.pdf',sep = ""),width = 6, height = 4, device = 'pdf')
+# 
+# # with the ellipse
+# (pcoa=ggplot()+
+#     geom_point(data=subset(coordinates.pcoa.wunifrac[,c(1,2)]),
+#                mapping = aes(x = `Axis.1`, y = `Axis.2`, colour = color),
+#                alpha = 0.8, size = 3) + 
+#     labs(title = 'Weighted UniFrac Distance',
+#          subtitle = paste0('p(adonis) = ', adonis.p, ', p(betadisp) = ', betadisp.p))+
+#     xlab(paste('PC1 (',label_percent()(pcoa.wunifrac$values$Rel_corr_eig[1]),')',sep = '')) +
+#     ylab(paste('PC2 (',label_percent()(pcoa.wunifrac$values$Rel_corr_eig[2]),')',sep = '')) +
+#         stat_ellipse(data=subset(coordinates.pcoa.wunifrac[,c(1,2)]),
+#                  mapping = aes(x = `Axis.1`, y = `Axis.2`, colour = color),
+#                  type = 'norm') +
+#     theme(panel.grid.major = element_blank(),
+#           panel.grid.minor = element_blank(),
+#           panel.background = element_blank(),
+#           axis.line = element_line(colour = 'black'),
+#           legend.title=element_blank(),
+#           legend.position = 'bottom',
+#           legend.text = element_text(size=15))+
+#     scale_color_manual(values = custom_colors_phase))
+# ggsave(paste(PFIG,"/",'pcoa_weightedUniFrac.coloredByPhase.png',sep = ""),width = 4, height = 4, device = 'png')
+
+
+# function to test adonis and betadisp between selected phases
+test_adonis_betadisp = function(dm.in = dm, metadata = metadata.o, group1, group2) {
+  idx = rownames(subset(metadata.o,phase %in% c(group1, group2)))
+  dm.tmp = dist_subset(dm.in,idx)
+  metadata.o.tmp = subset(metadata.o,rownames(metadata.o) %in% idx)
+  adonis.r = adonis2(dm.tmp~phase,metadata.o.tmp,permut = 1000)
+  adonis.p = round(adonis.r$`Pr(>F)`[1],digits = 4)
+  betadisp.r = permutest(betadisper(dm.tmp,metadata.o.tmp$phase),permutations = 1000)
+  betadisp.p = round(betadisp.r$tab[[6]][1],digits = 4)
+  if (all(rownames(metadata.o.tmp) == names(dm.tmp))) {
+    print(adonis.r)
+    print(betadisp.r)
+    return(c(adonis.p,betadisp.p))}
+   else {return(NULL)}
+}
+
+adonis_betadist_byPhase_pairwise = data.frame(
+  pre_VS_early = test_adonis_betadisp(group1 = 'pre-infection', group2 = 'early infection'),
+  pre_VS_late = test_adonis_betadisp(group1 = 'pre-infection', group2 = 'late infection'),
+  early_VS_late= test_adonis_betadisp(group1 = 'early infection', group2 = 'late infection')
+)
+adonis_betadist_byPhase_pairwise$test = c('PERMANOVA','PERMDISP')
+
+# Use pivot_longer to convert the data frame to long format
+adonis_betadist_byPhase_pairwise.stacked <- adonis_betadist_byPhase_pairwise %>%
+  pivot_longer(cols = names(adonis_betadist_byPhase_pairwise)[1:3], # Specify the columns to pivot
+               names_to = "comparisons",
+               values_to = "p value") %>% 
+  group_by(test) %>%
+  adjust_pvalue(p.col = 'p value', method = "holm")
+
+
+
+create_dt(adonis_betadist_byPhase_pairwise.stacked, 'PERMANOVA and PERMDISP pairwise testing results (p value adjusted by holm method)')
+
+```
+
+
+# Differential abundance testing
+
+Here we only test taxa with prevalence > 0.1 (i.e., taxa present in > 10% of total number of samples) to reduce the number of tests to do and increase statistical power.
+
+
+```{r DA load}
+#use the un-rarefied table for ANCOMBC analysis as suggested by the authors of ANCOM-BC
+pu<-qza_to_phyloseq(
+  features="analysis_from_bcdPrm/PE_bcdPrm_dada2.qza",
+  tree="analysis_from_bcdPrm/PE_bcdPrm_rooted-tree.qza",
+  taxonomy="analysis_from_bcdPrm/PE_bcdPrm_taxonomy.qza",
+  metadata=paste(FAS,'metadata_selected_rows_controlOnlyAnalysis.csv',sep = '/'))
+
+pu@sam_data$phase = factor(pu@sam_data$phase,levels = c('pre-infection','early infection', 'late infection'))
+
+```
+
+## Genus level
+
+### Early infection VS pre-infection
+
+```{r da early vs pre}
+compare = c('pre-infection','early infection')
+
+# run ancombc
+obj.tmp = subset_samples(pu, phase %in% compare)
+if (!all(obj.tmp@sam_data$Condition ==  'CTRL')) {
+  stop("samples other than control group are present. Execution stopped here")
+}
+if (!all(obj.tmp@sam_data$phase %in% compare)) {
+  stop(paste0("other phases present. Execution stopped here. phases present are ", unique(obj.tmp@sam_data$phase)))
+}
+obj.tmp.ac = ancombc(phyloseq = obj.tmp, #the input data (phyloseq object)
+                          formula = 'phase', #the character string expresses how microbial absolute abundances for each taxon depend on the variables in metadata.
+                          tax_level = "Genus", #character. The taxonomic level of interest. The input data can be agglomerated at different taxonomic levels
+                          p_adj_method = "holm", #character. method to adjust p-values. Default is "holm".
+                          prv_cut = 0.1, #a numerical fraction between 0 and 1. Taxa with prevalences less than prv_cut will be excluded in the analysis. Default is 0.10.
+                          lib_cut = 0, #a numerical threshold for filtering samples based on library sizes. Samples with library sizes less than lib_cut will be excluded in the analysis. Default is 0, i.e. do not discard any sample.
+                          group = NULL, #character. the name of the group variable in metadata. group should be discrete. Specifying group is required for detecting structural zeros and performing global test. Default is NULL. If the group of interest contains only two categories, leave it as NULL.
+                          struc_zero = F, #logical. whether to detect structural zeros based on group. Default is FALSE.
+                          neg_lb = F, #logical. whether to classify a taxon as a structural zero using its asymptotic lower bound. Default is FALSE.
+                          tol = 1e-5, #numeric. the iteration convergence tolerance for the E-M algorithm. Default is 1e-05.
+                          max_iter = 100, #numeric. the maximum number of iterations for the E-M algorithm. Default is 100.
+                          conserve = TRUE, #logical. whether to use a conservative variance estimator for the test statistic. It is recommended if the sample size is small and/or the number of differentially abundant taxa is believed to be large. Default is FALSE.
+                          alpha = 0.05, #numeric. level of significance. Default is 0.05.
+                          global = F, #logical. whether to perform the global test. Default is FALSE.
+                          n_cl = 1, #numeric. The number of nodes to be forked. For details, see ?parallel::makeCluster. Default is 1 (no parallel computing).
+                          verbose = F) #logical. Whether to generate verbose output during the ANCOM-BC fitting process. Default is FALSE.
+
+res = as.data.frame(obj.tmp.ac$res)
+res$comparison = paste(rev(unique(obj.tmp@sam_data$phase)),collapse = ' VS ')
+# 
+
+
+res.pre_early = res
+res.pre_early = res.pre_early %>%
+  transmute(taxon = lfc.taxon,
+            lfc = lfc.phaseearly.infection,
+            se = se.phaseearly.infection,
+            p = p_val.phaseearly.infection,
+            q = q_val.phaseearly.infection,
+            comparison = comparison,
+            test_group = 'early infection')
+
+create_dt(res.pre_early,'Early infection VS pre-infection')
+```
+
+### Late infection VS pre-infection
+
+```{r da late vs pre}
+compare = c('pre-infection','late infection')
+
+# run ancombc
+obj.tmp = subset_samples(pu, phase %in% compare)
+if (!all(obj.tmp@sam_data$Condition ==  'CTRL')) {
+  stop("samples other than control group are present. Execution stopped here")
+}
+if (!all(obj.tmp@sam_data$phase %in% compare)) {
+  stop(paste0("other phases present. Execution stopped here. phases present are ", unique(obj.tmp@sam_data$phase)))
+}
+obj.tmp.ac = ancombc(phyloseq = obj.tmp, #the input data (phyloseq object)
+                          formula = 'phase', #the character string expresses how microbial absolute abundances for each taxon depend on the variables in metadata.
+                          tax_level = "Genus", #character. The taxonomic level of interest. The input data can be agglomerated at different taxonomic levels
+                          p_adj_method = "holm", #character. method to adjust p-values. Default is "holm".
+                          prv_cut = 0.1, #a numerical fraction between 0 and 1. Taxa with prevalences less than prv_cut will be excluded in the analysis. Default is 0.10.
+                          lib_cut = 0, #a numerical threshold for filtering samples based on library sizes. Samples with library sizes less than lib_cut will be excluded in the analysis. Default is 0, i.e. do not discard any sample.
+                          group = NULL, #character. the name of the group variable in metadata. group should be discrete. Specifying group is required for detecting structural zeros and performing global test. Default is NULL. If the group of interest contains only two categories, leave it as NULL.
+                          struc_zero = F, #logical. whether to detect structural zeros based on group. Default is FALSE.
+                          neg_lb = F, #logical. whether to classify a taxon as a structural zero using its asymptotic lower bound. Default is FALSE.
+                          tol = 1e-5, #numeric. the iteration convergence tolerance for the E-M algorithm. Default is 1e-05.
+                          max_iter = 100, #numeric. the maximum number of iterations for the E-M algorithm. Default is 100.
+                          conserve = TRUE, #logical. whether to use a conservative variance estimator for the test statistic. It is recommended if the sample size is small and/or the number of differentially abundant taxa is believed to be large. Default is FALSE.
+                          alpha = 0.05, #numeric. level of significance. Default is 0.05.
+                          global = F, #logical. whether to perform the global test. Default is FALSE.
+                          n_cl = 1, #numeric. The number of nodes to be forked. For details, see ?parallel::makeCluster. Default is 1 (no parallel computing).
+                          verbose = F) #logical. Whether to generate verbose output during the ANCOM-BC fitting process. Default is FALSE.
+
+res = as.data.frame(obj.tmp.ac$res)
+res$comparison = paste(rev(unique(obj.tmp@sam_data$phase)),collapse = ' VS ')
+# 
+
+res.pre_late = res
+res.pre_late = res.pre_late %>%
+  transmute(taxon = lfc.taxon,
+            lfc = lfc.phaselate.infection,
+            se = se.phaselate.infection,
+            p = p_val.phaselate.infection,
+            q = q_val.phaselate.infection,
+            comparison = comparison,
+            test_group = 'late infection')
+
+create_dt(res.pre_late,'Late infection VS pre-infection')
+
+```
+
+### Late infection VS early infection
+
+```{r da late vs early}
+compare = c('early infection','late infection')
+
+# run ancombc
+obj.tmp = subset_samples(pu, phase %in% compare)
+if (!all(obj.tmp@sam_data$Condition ==  'CTRL')) {
+  stop("samples other than control group are present. Execution stopped here")
+}
+if (!all(obj.tmp@sam_data$phase %in% compare)) {
+  stop(paste0("other phases present. Execution stopped here. phases present are ", unique(obj.tmp@sam_data$phase)))
+}
+obj.tmp.ac = ancombc(phyloseq = obj.tmp, #the input data (phyloseq object)
+                          formula = 'phase', #the character string expresses how microbial absolute abundances for each taxon depend on the variables in metadata.
+                          tax_level = "Genus", #character. The taxonomic level of interest. The input data can be agglomerated at different taxonomic levels
+                          p_adj_method = "holm", #character. method to adjust p-values. Default is "holm".
+                          prv_cut = 0.1, #a numerical fraction between 0 and 1. Taxa with prevalences less than prv_cut will be excluded in the analysis. Default is 0.10.
+                          lib_cut = 0, #a numerical threshold for filtering samples based on library sizes. Samples with library sizes less than lib_cut will be excluded in the analysis. Default is 0, i.e. do not discard any sample.
+                          group = NULL, #character. the name of the group variable in metadata. group should be discrete. Specifying group is required for detecting structural zeros and performing global test. Default is NULL. If the group of interest contains only two categories, leave it as NULL.
+                          struc_zero = F, #logical. whether to detect structural zeros based on group. Default is FALSE.
+                          neg_lb = F, #logical. whether to classify a taxon as a structural zero using its asymptotic lower bound. Default is FALSE.
+                          tol = 1e-5, #numeric. the iteration convergence tolerance for the E-M algorithm. Default is 1e-05.
+                          max_iter = 100, #numeric. the maximum number of iterations for the E-M algorithm. Default is 100.
+                          conserve = TRUE, #logical. whether to use a conservative variance estimator for the test statistic. It is recommended if the sample size is small and/or the number of differentially abundant taxa is believed to be large. Default is FALSE.
+                          alpha = 0.05, #numeric. level of significance. Default is 0.05.
+                          global = F, #logical. whether to perform the global test. Default is FALSE.
+                          n_cl = 1, #numeric. The number of nodes to be forked. For details, see ?parallel::makeCluster. Default is 1 (no parallel computing).
+                          verbose = F) #logical. Whether to generate verbose output during the ANCOM-BC fitting process. Default is FALSE.
+
+res = as.data.frame(obj.tmp.ac$res)
+res$comparison = paste(rev(unique(obj.tmp@sam_data$phase)),collapse = ' VS ')
+# 
+
+res.early_late = res
+res.early_late = res.early_late %>%
+  transmute(taxon = lfc.taxon,
+            lfc = lfc.phaselate.infection,
+            se = se.phaselate.infection,
+            p = p_val.phaselate.infection,
+            q = q_val.phaselate.infection,
+            comparison = comparison,
+            test_group = 'late infection')
+
+create_dt(res.early_late,'Late infection VS early infection')
+
+```
+
+### Plot the significant Genera for all three comparisons
+
+Here we plot all genera with q < 0.1
+
+Asterisks: 
+
+q < 0.1: "s"
+
+q < 0.05: "*"
+
+q < 0.01: "**"
+
+q < 0.001: "***"
+
+
+```{r da plot,fig.width=12,fig.height=5}
+res.merged = bind_rows(res.early_late,res.pre_early)
+res.merged = bind_rows(res.merged,res.pre_late)
+res.merged.genus.sig = subset(res.merged, grepl('Genus',res.merged$taxon) & q < 0.1)
+
+res.merged.genus.sig$q_asterisks = 
+  ifelse(res.merged.genus.sig$q > 0.05, 's',
+         ifelse(res.merged.genus.sig$q > 0.01, "*",
+                ifelse(res.merged.genus.sig$q > 0.001, '**', '***')))
+
+res.merged.genus.sig$comparison = factor(res.merged.genus.sig$comparison,levels = c('early infection VS pre-infection',
+                                                                                    'late infection VS pre-infection',
+                                                                                    'late infection VS early infection'))
+ggplot(data = res.merged.genus.sig, 
+       mapping = aes(x = taxon,y = lfc))+
+  geom_bar(stat = 'identity',
+           position=position_dodge())+
+  geom_errorbar(mapping = aes(ymin = lfc - se,
+                              ymax = lfc + se),
+                width = 0.3,
+                size = 0.4,
+                position = position_dodge(width = 1.5)) +
+  geom_abline(slope = 0, intercept = 0, linetype="dashed", alpha=0.5)+
+  facet_grid(.~comparison,scales = 'free_y')+
+  labs(x='Genus', y="Log fold change (natural log)")+
+  theme_bw()+
+  theme(panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        legend.position = 'none',
+        text = element_text(size = 16, colour = 'black'),
+        strip.text.x = element_text(size = 10, color = "black", face = "bold"),
+        strip.text.y = element_text(size = 15, color = "black", face = "bold")) +
+  
+  geom_text(mapping = aes(x = taxon, y = lfc + 1*sign(lfc), label = q_asterisks),
+            position = position_dodge(width = 1),
+            size = 3, color = 'red')+
+  coord_flip()+
+  scale_fill_uchicago(alpha=0.8)
+ggsave(paste(PFIG,'ancombc_by_phase_pairwise.png',sep = '/'),width = 14,height = 4, device = 'png')
+
+
+```
+
+
+## Family level
+
+### Early infection VS pre-infection
+
+```{r da early vs pre F}
+compare = c('pre-infection','early infection')
+taxLevel = 'Family'
+# run ancombc
+obj.tmp = subset_samples(pu, phase %in% compare)
+if (!all(obj.tmp@sam_data$Condition ==  'CTRL')) {
+  stop("samples other than control group are present. Execution stopped here")
+}
+if (!all(obj.tmp@sam_data$phase %in% compare)) {
+  stop(paste0("other phases present. Execution stopped here. phases present are ", unique(obj.tmp@sam_data$phase)))
+}
+obj.tmp.ac = ancombc(phyloseq = obj.tmp, #the input data (phyloseq object)
+                          formula = 'phase', #the character string expresses how microbial absolute abundances for each taxon depend on the variables in metadata.
+                          tax_level = taxLevel, #character. The taxonomic level of interest. The input data can be agglomerated at different taxonomic levels
+                          p_adj_method = "holm", #character. method to adjust p-values. Default is "holm".
+                          prv_cut = 0.1, #a numerical fraction between 0 and 1. Taxa with prevalences less than prv_cut will be excluded in the analysis. Default is 0.10.
+                          lib_cut = 0, #a numerical threshold for filtering samples based on library sizes. Samples with library sizes less than lib_cut will be excluded in the analysis. Default is 0, i.e. do not discard any sample.
+                          group = NULL, #character. the name of the group variable in metadata. group should be discrete. Specifying group is required for detecting structural zeros and performing global test. Default is NULL. If the group of interest contains only two categories, leave it as NULL.
+                          struc_zero = F, #logical. whether to detect structural zeros based on group. Default is FALSE.
+                          neg_lb = F, #logical. whether to classify a taxon as a structural zero using its asymptotic lower bound. Default is FALSE.
+                          tol = 1e-5, #numeric. the iteration convergence tolerance for the E-M algorithm. Default is 1e-05.
+                          max_iter = 100, #numeric. the maximum number of iterations for the E-M algorithm. Default is 100.
+                          conserve = TRUE, #logical. whether to use a conservative variance estimator for the test statistic. It is recommended if the sample size is small and/or the number of differentially abundant taxa is believed to be large. Default is FALSE.
+                          alpha = 0.05, #numeric. level of significance. Default is 0.05.
+                          global = F, #logical. whether to perform the global test. Default is FALSE.
+                          n_cl = 1, #numeric. The number of nodes to be forked. For details, see ?parallel::makeCluster. Default is 1 (no parallel computing).
+                          verbose = F) #logical. Whether to generate verbose output during the ANCOM-BC fitting process. Default is FALSE.
+
+res = as.data.frame(obj.tmp.ac$res)
+res$comparison = paste(rev(unique(obj.tmp@sam_data$phase)),collapse = ' VS ')
+# 
+
+
+res.pre_early = res
+res.pre_early = res.pre_early %>%
+  transmute(taxon = lfc.taxon,
+            lfc = lfc.phaseearly.infection,
+            se = se.phaseearly.infection,
+            p = p_val.phaseearly.infection,
+            q = q_val.phaseearly.infection,
+            comparison = comparison,
+            test_group = 'early infection')
+
+create_dt(res.pre_early,'Early infection VS pre-infection')
+```
+
+### Late infection VS pre-infection
+
+```{r da late vs pre F}
+compare = c('pre-infection','late infection')
+taxLevel = 'Family'
+# run ancombc
+obj.tmp = subset_samples(pu, phase %in% compare)
+if (!all(obj.tmp@sam_data$Condition ==  'CTRL')) {
+  stop("samples other than control group are present. Execution stopped here")
+}
+if (!all(obj.tmp@sam_data$phase %in% compare)) {
+  stop(paste0("other phases present. Execution stopped here. phases present are ", unique(obj.tmp@sam_data$phase)))
+}
+obj.tmp.ac = ancombc(phyloseq = obj.tmp, #the input data (phyloseq object)
+                          formula = 'phase', #the character string expresses how microbial absolute abundances for each taxon depend on the variables in metadata.
+                          tax_level = taxLevel, #character. The taxonomic level of interest. The input data can be agglomerated at different taxonomic levels
+                          p_adj_method = "holm", #character. method to adjust p-values. Default is "holm".
+                          prv_cut = 0.1, #a numerical fraction between 0 and 1. Taxa with prevalences less than prv_cut will be excluded in the analysis. Default is 0.10.
+                          lib_cut = 0, #a numerical threshold for filtering samples based on library sizes. Samples with library sizes less than lib_cut will be excluded in the analysis. Default is 0, i.e. do not discard any sample.
+                          group = NULL, #character. the name of the group variable in metadata. group should be discrete. Specifying group is required for detecting structural zeros and performing global test. Default is NULL. If the group of interest contains only two categories, leave it as NULL.
+                          struc_zero = F, #logical. whether to detect structural zeros based on group. Default is FALSE.
+                          neg_lb = F, #logical. whether to classify a taxon as a structural zero using its asymptotic lower bound. Default is FALSE.
+                          tol = 1e-5, #numeric. the iteration convergence tolerance for the E-M algorithm. Default is 1e-05.
+                          max_iter = 100, #numeric. the maximum number of iterations for the E-M algorithm. Default is 100.
+                          conserve = TRUE, #logical. whether to use a conservative variance estimator for the test statistic. It is recommended if the sample size is small and/or the number of differentially abundant taxa is believed to be large. Default is FALSE.
+                          alpha = 0.05, #numeric. level of significance. Default is 0.05.
+                          global = F, #logical. whether to perform the global test. Default is FALSE.
+                          n_cl = 1, #numeric. The number of nodes to be forked. For details, see ?parallel::makeCluster. Default is 1 (no parallel computing).
+                          verbose = F) #logical. Whether to generate verbose output during the ANCOM-BC fitting process. Default is FALSE.
+
+res = as.data.frame(obj.tmp.ac$res)
+res$comparison = paste(rev(unique(obj.tmp@sam_data$phase)),collapse = ' VS ')
+# 
+
+res.pre_late = res
+res.pre_late = res.pre_late %>%
+  transmute(taxon = lfc.taxon,
+            lfc = lfc.phaselate.infection,
+            se = se.phaselate.infection,
+            p = p_val.phaselate.infection,
+            q = q_val.phaselate.infection,
+            comparison = comparison,
+            test_group = 'late infection')
+
+create_dt(res.pre_late,'Late infection VS pre-infection')
+
+```
+
+### Late infection VS early infection
+
+```{r da late vs early F}
+compare = c('early infection','late infection')
+taxLevel = 'Family'
+# run ancombc
+obj.tmp = subset_samples(pu, phase %in% compare)
+if (!all(obj.tmp@sam_data$Condition ==  'CTRL')) {
+  stop("samples other than control group are present. Execution stopped here")
+}
+if (!all(obj.tmp@sam_data$phase %in% compare)) {
+  stop(paste0("other phases present. Execution stopped here. phases present are ", unique(obj.tmp@sam_data$phase)))
+}
+obj.tmp.ac = ancombc(phyloseq = obj.tmp, #the input data (phyloseq object)
+                          formula = 'phase', #the character string expresses how microbial absolute abundances for each taxon depend on the variables in metadata.
+                          tax_level = taxLevel, #character. The taxonomic level of interest. The input data can be agglomerated at different taxonomic levels
+                          p_adj_method = "holm", #character. method to adjust p-values. Default is "holm".
+                          prv_cut = 0.1, #a numerical fraction between 0 and 1. Taxa with prevalences less than prv_cut will be excluded in the analysis. Default is 0.10.
+                          lib_cut = 0, #a numerical threshold for filtering samples based on library sizes. Samples with library sizes less than lib_cut will be excluded in the analysis. Default is 0, i.e. do not discard any sample.
+                          group = NULL, #character. the name of the group variable in metadata. group should be discrete. Specifying group is required for detecting structural zeros and performing global test. Default is NULL. If the group of interest contains only two categories, leave it as NULL.
+                          struc_zero = F, #logical. whether to detect structural zeros based on group. Default is FALSE.
+                          neg_lb = F, #logical. whether to classify a taxon as a structural zero using its asymptotic lower bound. Default is FALSE.
+                          tol = 1e-5, #numeric. the iteration convergence tolerance for the E-M algorithm. Default is 1e-05.
+                          max_iter = 100, #numeric. the maximum number of iterations for the E-M algorithm. Default is 100.
+                          conserve = TRUE, #logical. whether to use a conservative variance estimator for the test statistic. It is recommended if the sample size is small and/or the number of differentially abundant taxa is believed to be large. Default is FALSE.
+                          alpha = 0.05, #numeric. level of significance. Default is 0.05.
+                          global = F, #logical. whether to perform the global test. Default is FALSE.
+                          n_cl = 1, #numeric. The number of nodes to be forked. For details, see ?parallel::makeCluster. Default is 1 (no parallel computing).
+                          verbose = F) #logical. Whether to generate verbose output during the ANCOM-BC fitting process. Default is FALSE.
+
+res = as.data.frame(obj.tmp.ac$res)
+res$comparison = paste(rev(unique(obj.tmp@sam_data$phase)),collapse = ' VS ')
+# 
+
+res.early_late = res
+res.early_late = res.early_late %>%
+  transmute(taxon = lfc.taxon,
+            lfc = lfc.phaselate.infection,
+            se = se.phaselate.infection,
+            p = p_val.phaselate.infection,
+            q = q_val.phaselate.infection,
+            comparison = comparison,
+            test_group = 'late infection')
+
+create_dt(res.early_late,'Late infection VS early infection')
+
+```
+
+### Plot the significant families for all three comparisons
+
+Here we plot all families with q < 0.1
+
+Asterisks: 
+
+q < 0.1: "s"
+
+q < 0.05: "*"
+
+q < 0.01: "**"
+
+q < 0.001: "***"
+
+```{r da plot F,fig.width=12,fig.height=5}
+res.merged = bind_rows(res.early_late,res.pre_early)
+res.merged = bind_rows(res.merged,res.pre_late)
+res.merged.family.sig = subset(res.merged, grepl('Family',res.merged$taxon) & q < 0.1)
+
+res.merged.family.sig$q_asterisks = 
+  ifelse(res.merged.family.sig$q > 0.05, 's',
+         ifelse(res.merged.family.sig$q > 0.01, "*",
+                ifelse(res.merged.family.sig$q > 0.001, '**', '***')))
+
+res.merged.family.sig$comparison = factor(res.merged.family.sig$comparison,levels = c('early infection VS pre-infection',
+                                                                                    'late infection VS pre-infection',
+                                                                                    'late infection VS early infection'))
+ggplot(data = res.merged.family.sig, 
+       mapping = aes(x = taxon,y = lfc))+
+  geom_bar(stat = 'identity',
+           position=position_dodge())+
+  geom_errorbar(mapping = aes(ymin = lfc - se,
+                              ymax = lfc + se),
+                width = 0.3,
+                size = 0.4,
+                position = position_dodge(width = 1.5)) +
+  geom_abline(slope = 0, intercept = 0, linetype="dashed", alpha=0.5)+
+  facet_grid(.~comparison,scales = 'free_y')+
+  labs(x='Family', y="Log fold change (natural log)")+
+  theme_bw()+
+  theme(panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        legend.position = 'none',
+        text = element_text(size = 16, colour = 'black'),
+        strip.text.x = element_text(size = 10, color = "black", face = "bold"),
+        strip.text.y = element_text(size = 15, color = "black", face = "bold")) +
+  
+  geom_text(mapping = aes(x = taxon, y = lfc + 1*sign(lfc), label = q_asterisks),
+            position = position_dodge(width = 1),
+            size = 3, color = 'red')+
+  coord_flip()+
+  scale_fill_uchicago(alpha=0.8)
+ggsave(paste(PFIG,'ancombc_by_phase_pairwise.png',sep = '/'),width = 14,height = 4, device = 'png')
+
+
+```
+
+
+
+# Session Information and save R image
+
+```{r session, results='markup'}
+sessionInfo()
+devtools::session_info()
+
+#save.image('rarefied_table_and_DA_analysis_ControlOnly_1.RData')
+```
